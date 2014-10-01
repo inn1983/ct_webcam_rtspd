@@ -1,3 +1,7 @@
+#define LOG_NDEBUG 0
+#define LOG_TAG "venc-file"
+#include "CDX_Debug.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +12,7 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-#include <linux/videodev2.h>
+//#include <linux/videodev2.h>
 #include <time.h>
 #include <errno.h>
 
@@ -23,9 +27,38 @@
 
 #include "type.h"
 #include "H264encLibApi.h"
+#include "V4L2.h"
+#include "venc.h"
+#include "CameraSource.h"
+#include "water_mark.h"
+#include "cedarv_osal_linux.h"
+
 #include "capture_slice.h"
 
 #define CLEAR(x) memset (&(x), 0, sizeof (x))
+
+unsigned int mwidth = 720;
+unsigned int mheight = 480;
+
+typedef struct Venc_context
+{
+	cedarv_encoder_t *venc_device;
+	VencBaseConfig base_cfg;
+	VencInputBuffer input_buffer;
+	VencOutputBuffer output_buffer;
+	VencAllocateBufferParam alloc_parm;
+	VencSeqHeader header_data;
+	AWCameraDevice *CameraDevice;	
+	pthread_t thread_enc_id;
+	int mstart;
+	FILE *out_file;
+	WaterMark*	waterMark;
+}Venc_context;
+
+Venc_context *g_venc_cam_cxt;
+//VencAllocateBufferParam alloc_parm;	// 用于保存inputbuffer申请时的参数
+
+motion_par g_motionPar;
 
 // 描述一个 h264 slice
 typedef struct slice_t
@@ -42,9 +75,11 @@ typedef struct Buffer
 	void * start;		// mmap ret
 	size_t length;		// 
 
-	void *cedar_vaddr;	// v4l2 使用的是 yuyv 格式，但 cedar enc 需要 yuv420p 格式，
+	//void *cedar_vaddr;	// v4l2 使用的是 yuyv 格式，但 cedar enc 需要 yuv420p 格式，
 				// 这个 cedar_vaddr 分配的用于保存 yuv420p 数据的连续物理内存。
-	unsigned long cedar_phyaddr;
+	//unsigned long cedar_phyaddr;
+	
+	VencInputBuffer input_buffer; //merge new cedarx api by inn.
 } Buffer;
 
 typedef struct capture_t
@@ -97,29 +132,28 @@ static capture_t *_cap = 0;
 
 //////// 
 //#define DUMP_YUV420P
-
-static void yuyv_yuv420p(const unsigned char *p, unsigned char *q, int width, int height)
+static void yuyv_nv12(const unsigned char *pyuyv, unsigned char *pnv12, int width, int height)
 {
-	unsigned char *Y = q;
-	unsigned char *U = Y + width * height;
-	unsigned char *V = U + width * height / 4;
+	unsigned char *Y = pnv12;
+	unsigned char *UV = Y + width * height;
+	//unsigned char *V = U + width * height / 4;
 	int i, j;
 
 	for (i = 0; i < height / 2; i++) {
 		// 奇数行保留 U/V
 		for (j = 0; j < width / 2; j++) {
-			*Y++ = *p++;
-			*U++ = *p++;
-			*Y++ = *p++;
-			*V++ = *p++;
+			*Y++ = *pyuyv++;
+			*UV++ = *pyuyv++;	//U
+			*Y++ = *pyuyv++;
+			*UV++ = *pyuyv++;	//V
 		}
 
 		// 偶数行的 UV 直接扔掉
 		for (j = 0; j < width / 2; j++) {
-			*Y++ = *p++;
-			p++;		// 跳过 U
-			*Y++ = *p++;
-			p++;		// 跳过 V
+			*Y++ = *pyuyv++;
+			pyuyv++;		// 跳过 U
+			*Y++ = *pyuyv++;
+			pyuyv++;		// 跳过 V
 		}
 	}
 
@@ -139,6 +173,69 @@ static void yuyv_yuv420p(const unsigned char *p, unsigned char *q, int width, in
 		fclose(fp);
 	}
 #endif // 
+}
+
+int CameraSourceCallback(void *cookie,  void *data)
+{
+	Venc_context * venc_cam_cxt = (Venc_context *)cookie;
+	cedarv_encoder_t *venc_device = venc_cam_cxt->venc_device;
+	AWCameraDevice *CameraDevice = venc_cam_cxt->CameraDevice;
+	static int has_alloc_buffer = 0;
+	
+	VencInputBuffer input_buffer;
+	int result = 0;
+	//int has_alloc_buffer = 0;
+	
+
+	struct v4l2_buffer *p_buf = (struct v4l2_buffer *)data;
+	v4l2_mem_map_t* p_v4l2_mem_map = GetMapmemAddress(getV4L2ctx(CameraDevice));	
+
+	void *buffer = (void *)p_v4l2_mem_map->mem[p_buf->index];
+	int size_y = venc_cam_cxt->base_cfg.input_width*venc_cam_cxt->base_cfg.input_height; 
+
+	memset(&input_buffer, 0, sizeof(VencInputBuffer));
+	
+	result = venc_device->ioctrl(venc_device, VENC_CMD_GET_ALLOCATE_INPUT_BUFFER, &input_buffer);
+	
+	if(result != 0) {
+		LOGD("no alloc input buffer right now");
+		usleep(10*1000);
+		return -1;
+	}
+	yuyv_nv12( (unsigned char*)buffer, input_buffer.addrvirY, 720, 480);
+	
+	//input_buffer.id = p_buf->index;
+	//input_buffer.addrphyY = p_buf->m.offset;
+	//input_buffer.addrphyC = p_buf->m.offset + size_y;
+
+	//LOGD("buffer address is %x", buffer);
+	//input_buffer.addrvirY = buffer;
+	//input_buffer.addrvirC = buffer + size_y;
+
+	input_buffer.pts = 1000000 * (long long)p_buf->timestamp.tv_sec + (long long)p_buf->timestamp.tv_usec;
+	LOGD("pts = %ll", input_buffer.pts);
+
+#if 1
+	if(input_buffer.addrphyY >=  (void*)0x40000000)
+		input_buffer.addrphyY -=0x40000000;
+#endif
+
+	if(!venc_cam_cxt->mstart) {
+		LOGD("p_buf->index = %d\n", p_buf->index);
+		CameraDevice->returnFrame(CameraDevice, p_buf->index);
+	}
+
+    // enquene buffer to input buffer quene
+    
+	LOGD("ID = %d\n", input_buffer.id);
+	result = venc_device->ioctrl(venc_device, VENC_CMD_ENQUENE_INPUT_BUFFER, &input_buffer);
+
+	if(result < 0) {
+		CameraDevice->returnFrame(CameraDevice, p_buf->index);
+		LOGW("video input buffer is full , skip this frame");
+	}
+
+	return 0;
 }
 
 static slice_t *slice_alloc(const void *data, int len, int64_t pts)
@@ -169,11 +266,12 @@ static void slice_free(slice_t *s)
 	free(s);
 }
 
-static VENC_DEVICE *g_pCedarV = 0;
+//static VENC_DEVICE *g_pCedarV = 0;
 static int g_cur_id = -1;
 
 static int GetPreviewFrame(capture_t *cap, V4L2BUF_t *pBuf);
 
+/*
 // FIXME: 貌似这个有个 mode 的参数 ？？
 extern "C" int cedarx_hardware_init();
 extern "C" void cedarx_hardware_exit();
@@ -184,7 +282,8 @@ extern "C" void* cdxalloc_alloc(int size);
 extern "C" void* cdxalloc_allocregs();
 extern "C" void cdxalloc_free(void *address);
 extern "C" unsigned int cdxalloc_vir2phy(void *address);
-
+*/
+/*
 // FIXME: 这个 uParam1 如何传递呢？照理说应该传递 capture_t* 就方便了
 static __s32 WaitFinishCB(__s32 uParam1, void *pMsg)
 {
@@ -226,19 +325,42 @@ static __s32 GetFrmBufCB(__s32 uParam1,  void *pFrmBufInfo)
 	
 	return 0;
 }
+*/
 
 static int CedarvEncInit(unsigned int width, unsigned int height, int fps, int bitratek)
 {
 	int ret = -1;
-
-	VENC_DEVICE *pCedarV = NULL;
+	/*
+	//VENC_DEVICE *pCedarV = NULL;
 	
-	pCedarV = H264EncInit(&ret);
+	//pCedarV = H264EncInit(&ret);
 	if (ret < 0) {
 		printf("H264EncInit failed\n");
 		return -1;
 	}
-
+	*/	
+	
+	g_venc_cam_cxt->base_cfg.framerate = 30;
+	g_venc_cam_cxt->base_cfg.input_width = mwidth;
+	g_venc_cam_cxt->base_cfg.input_height= mheight;
+	g_venc_cam_cxt->base_cfg.dst_width = mwidth;
+	g_venc_cam_cxt->base_cfg.dst_height = mheight;
+	g_venc_cam_cxt->base_cfg.maxKeyInterval = 25;
+	g_venc_cam_cxt->base_cfg.inputformat = VENC_PIXEL_YUV420; //uv combined
+	g_venc_cam_cxt->base_cfg.targetbitrate = 3*1024*1024;
+	// init allocate param
+	g_venc_cam_cxt->alloc_parm.buffernum = 4;
+	
+	g_venc_cam_cxt->venc_device = cedarvEncInit();
+	g_venc_cam_cxt->venc_device->ioctrl(g_venc_cam_cxt->venc_device, VENC_CMD_BASE_CONFIG, &g_venc_cam_cxt->base_cfg);
+	g_venc_cam_cxt->venc_device->ioctrl(g_venc_cam_cxt->venc_device, VENC_CMD_ALLOCATE_INPUT_BUFFER, &g_venc_cam_cxt->alloc_parm.buffernum);
+	g_venc_cam_cxt->venc_device->ioctrl(g_venc_cam_cxt->venc_device, VENC_CMD_OPEN, 0);
+	g_venc_cam_cxt->venc_device->ioctrl(g_venc_cam_cxt->venc_device, VENC_CMD_HEADER_DATA, &g_venc_cam_cxt->header_data);
+	g_venc_cam_cxt->venc_device->ioctrl(g_venc_cam_cxt->venc_device, VENC_CMD_SET_MOTION_PAR_FLAG, &g_motionPar);
+	
+	/* start encoder */
+	g_venc_cam_cxt->mstart = 1;
+/*
 	__video_encode_format_t enc_fmt;
 	enc_fmt.src_width = width;
 	enc_fmt.src_height = height;
@@ -251,7 +373,7 @@ static int CedarvEncInit(unsigned int width, unsigned int height, int fps, int b
 	enc_fmt.qp_min = 20;
 	enc_fmt.avg_bit_rate = bitratek * 1024;
 	enc_fmt.maxKeyInterval = fps * 2;
-	enc_fmt.profileIdc = 66; /* 100: high profile, 77: main profile, 66: base profile */
+	enc_fmt.profileIdc = 66; // 100: high profile, 77: main profile, 66: base profile 
 	enc_fmt.levelIdc = 31;
 	
 	if (pCedarV->IoCtrl(pCedarV, VENC_SET_ENC_INFO_CMD, (__u32)&enc_fmt) == -1) {
@@ -270,8 +392,8 @@ static int CedarvEncInit(unsigned int width, unsigned int height, int fps, int b
 	pCedarV->WaitFinishCB = WaitFinishCB;
 
 	g_pCedarV = pCedarV;
-
-	return ret;
+*/
+	return 0;
 }
 
 #ifdef ZQSENDER
@@ -366,11 +488,27 @@ static int send_data(ZqSenderTcpCtx *snd, __vbv_data_ctrl_info_t *data)
 static int InitCapture(capture_t *cap)
 {
 	// cedarx 驱动？
+/*
 	if (cdxalloc_open()) {
 		printf("cdxalloc open error!\n");
 		return -1;
 	}
-
+*/
+	
+	//g_venc_cam_cxt = (Venc_context *)malloc(sizeof(Venc_context));
+	//memset(g_venc_cam_cxt, 0, sizeof(Venc_context));
+	
+	/* create source */
+	g_venc_cam_cxt->CameraDevice = CreateCamera(mwidth, mheight);
+	
+	/* set camera source callback */
+	g_venc_cam_cxt->CameraDevice->setCameraDatacallback(g_venc_cam_cxt->CameraDevice, 
+		(void *)g_venc_cam_cxt, (void*)&CameraSourceCallback);
+	
+	/* start camera */
+	g_venc_cam_cxt->CameraDevice->startCamera(g_venc_cam_cxt->CameraDevice);
+	
+	/*
 	// open /dev/video0
 	cap->fd_ = open (cap->devname_.c_str(), O_RDWR | O_NONBLOCK, 0);
 	if (cap->fd_ == 0) {
@@ -429,10 +567,10 @@ static int InitCapture(capture_t *cap)
 		}
 
 	   	cap->buffers_[cap->buf_cnt_].length = buf.length;
-	   	cap->buffers_[cap->buf_cnt_].start = mmap (0 	/* start anywhere */,    
+	   	cap->buffers_[cap->buf_cnt_].start = mmap (0 	// start anywhere ,    
 			   buf.length,
-			   PROT_READ | PROT_WRITE 	/* required */,
-			   MAP_SHARED 			/* recommended */,
+			   PROT_READ | PROT_WRITE 	// required ,
+			   MAP_SHARED 			// recommended ,
 			   cap->fd_, buf.m.offset);
 
 	   	if (MAP_FAILED == cap->buffers_[cap->buf_cnt_].start) {
@@ -441,8 +579,8 @@ static int InitCapture(capture_t *cap)
 	   	}
 
 		// cedar 使用 yuv420p[_n_buffers].start) {
-		cap->buffers_[cap->buf_cnt_].cedar_vaddr = cdxalloc_alloc(cap->width_ * cap->height_ * 3 / 2);
-		cap->buffers_[cap->buf_cnt_].cedar_phyaddr = cdxalloc_vir2phy(cap->buffers_[cap->buf_cnt_].cedar_vaddr);
+		//cap->buffers_[cap->buf_cnt_].cedar_vaddr = cdxalloc_alloc(cap->width_ * cap->height_ * 3 / 2);
+		//cap->buffers_[cap->buf_cnt_].cedar_phyaddr = cdxalloc_vir2phy(cap->buffers_[cap->buf_cnt_].cedar_vaddr);
 	}
 
 	// 使能缓冲
@@ -459,10 +597,10 @@ static int InitCapture(capture_t *cap)
 			return -1;
 		}
 	}
-
+*/
 	return 0;
 }
-
+/*
 static void DeInitCapture(capture_t *cap)
 {
 	unsigned int i;
@@ -490,11 +628,13 @@ static void DeInitCapture(capture_t *cap)
 		cap->fd_ = 0;
 	}
 
-	/* cdxalloc_close make it crash, why? */
+	//cdxalloc_close make it crash, why? 
 	//if (cdxalloc_close()) printf("DBG: cdxalloc_close error!\n");
 	//else printf("DBG: cdxalloc closed\n");
 }
+*/
 
+/*
 static int StartStreaming(capture_t *cap)
 {
     	int ret = -1; 
@@ -511,7 +651,8 @@ static int StartStreaming(capture_t *cap)
     	printf("V4L2Camera::v4l2StartStreaming OK\n");
     	return 0; 
 }
-
+*/
+/*
 static void ReleaseFrame(capture_t *cap, int buf_id)
 {	
 	struct v4l2_buffer v4l2_buf;
@@ -528,7 +669,8 @@ static void ReleaseFrame(capture_t *cap, int buf_id)
 		return ;
 	}
 }
-
+*/
+/*
 static int WaitCamerReady(capture_t *cap)
 {
 	fd_set fds;		
@@ -538,7 +680,7 @@ static int WaitCamerReady(capture_t *cap)
 	FD_ZERO(&fds);
 	FD_SET(cap->fd_, &fds);
 	
-	/* Timeout */
+	// Timeout
 	tv.tv_sec  = 2;
 	tv.tv_usec = 0;
 	
@@ -554,7 +696,9 @@ static int WaitCamerReady(capture_t *cap)
 
 	return 0;
 }
+*/
 
+/*
 static int GetPreviewFrame(capture_t *cap, V4L2BUF_t *pBuf)	// DQ buffer for preview or encoder
 {
 	int ret = -1; 
@@ -587,10 +731,12 @@ static int GetPreviewFrame(capture_t *cap, V4L2BUF_t *pBuf)	// DQ buffer for pre
 
 	return 0;
 }
+*/
 
 // 工作线程
 void GrabThread::run()
 {
+	g_venc_cam_cxt = (Venc_context *)malloc(sizeof(Venc_context));
 	int ret = -1;
 #ifdef ZQSENDER
 	ZqSenderTcpCtx *sender = 0;
@@ -603,11 +749,25 @@ void GrabThread::run()
 	fprintf(stderr, "start tcp srv port 4000\n");
 #endif // zqsender
 	
-	ret = cedarx_hardware_init();
+	ret = cedarx_hardware_init(0);
 	if (ret < 0) {
 		printf("cedarx_hardware_init failed\n");
 		::exit(-1);
 	}
+	
+	LOGD("Codec version = %s", getCodecVision());
+	g_venc_cam_cxt->waterMark = (WaterMark*)malloc(sizeof(WaterMark));	
+	memset(g_venc_cam_cxt->waterMark, 0x0, sizeof(WaterMark));
+
+	g_venc_cam_cxt->waterMark->bgInfo.width = mwidth;
+	g_venc_cam_cxt->waterMark->bgInfo.height = mheight;
+	g_venc_cam_cxt->waterMark->srcPathPrefix = "/mnt/res/icon_720p_";
+	g_venc_cam_cxt->waterMark->srcNum = 13;
+	waterMarkInit(g_venc_cam_cxt->waterMark);
+	
+	/*移动侦测*/
+	g_motionPar.motion_detect_enable = 1;
+	g_motionPar.motion_detect_ratio = 0;
 	
 	ret = InitCapture(_cap);
 	if(ret != 0) {
@@ -622,31 +782,64 @@ void GrabThread::run()
 	}
 
 	printf("to stream on\n");
-	StartStreaming(_cap);
-
+	//StartStreaming(_cap);
+	static int bFirstFrame = 1;
 	while (!quit_) {
-		__vbv_data_ctrl_info_t data_info;
+		//__vbv_data_ctrl_info_t data_info;
+		int result = 0;
+		VencInputBuffer input_buffer;
+		VencOutputBuffer data_info;
+		cedarv_encoder_t *venc_device = g_venc_cam_cxt->venc_device;
+		
+		int motion_flag = 0;
 
 		// FIXME: encode 需要消耗一定时间，这里不准确
 		usleep(1000 * 1000 / _cap->fps_);	// 25fps
-	
-		ret = g_pCedarV->encode(g_pCedarV);
-		if (ret != 0) {
+		
+		memset(&input_buffer, 0, sizeof(VencInputBuffer));
+		// dequene buffer from input buffer quene;
+	    result = venc_device->ioctrl(venc_device, VENC_CMD_DEQUENE_INPUT_BUFFER, &input_buffer);
+		if(result<0)
+		{
+			LOGV("enquene input buffer is empty");
+			usleep(10*1000);
+			continue;
+		}
+		
+		g_venc_cam_cxt->waterMark->bgInfo.y = input_buffer.addrvirY;
+		g_venc_cam_cxt->waterMark->bgInfo.c = input_buffer.addrvirC;
+
+		waterMarkShowTime(g_venc_cam_cxt->waterMark);
+		
+		cedarx_cache_op((long int)input_buffer.addrvirY, 
+				(long int)input_buffer.addrvirY + g_venc_cam_cxt->waterMark->bgInfo.width * g_venc_cam_cxt->waterMark->bgInfo.height * 3/2, 0);
+		
+		//ret = g_pCedarV->encode(g_pCedarV);
+		result = venc_device->ioctrl(venc_device, VENC_CMD_ENCODE, &input_buffer);
+		
+		// return the buffer to the alloc buffer quene after encoder
+		venc_device->ioctrl(venc_device, VENC_CMD_RETURN_ALLOCATE_INPUT_BUFFER, &input_buffer);
+		
+		if (result != 0) {
 			usleep(10000);
 			printf("not encode, ret: %d\n", ret);
 			::exit(-1);
 		}
 
-		ReleaseFrame(_cap, g_cur_id);
+		//ReleaseFrame(_cap, g_cur_id);
 
-		memset(&data_info, 0 , sizeof(__vbv_data_ctrl_info_t));
-		ret = g_pCedarV->GetBitStreamInfo(g_pCedarV, &data_info);
-		if(ret == 0) {
+		//memset(&data_info, 0 , sizeof(__vbv_data_ctrl_info_t));
+		//ret = g_pCedarV->GetBitStreamInfo(g_pCedarV, &data_info);
+		
+		memset(&data_info, 0, sizeof(VencOutputBuffer));
+		result = venc_device->ioctrl(venc_device, VENC_CMD_GET_BITSTREAM, &data_info);
+		
+		if(result == 0) {
 			// 有数据
 #ifdef ZQSENDER
 			send_data(sender, &data_info);
 #endif // zqsender
-
+/*
 			if (data_info.privateDataLen > 0) {
 				if (_cap->priv)
 					slice_free(_cap->priv);
@@ -656,11 +849,18 @@ void GrabThread::run()
 				//ost::MutexLock al(_cap->cs_fifo_);
 				//_cap->fifo_.push_back(slice_alloc(data_info.privateData, data_info.privateDataLen, 0));
 			}
-
-			if (data_info.uSize0 > 0) {
+*/			if (bFirstFrame == 1){
+				if (_cap->priv)
+					slice_free(_cap->priv);
+				_cap->priv = slice_alloc(g_venc_cam_cxt->header_data.bufptr, g_venc_cam_cxt->header_data.length, 0);
+				fprintf(stderr, "save priv: len=%d\n", g_venc_cam_cxt->header_data.length);
+				bFirstFrame = 0;
+			}
+			
+			if (data_info.size0 > 0) {
 				ost::MutexLock al(_cap->cs_fifo_);
 
-				unsigned char *p = data_info.pData0;
+				unsigned char *p = data_info.ptr0;
 
 				if (_cap->fifo_.size() > 100 && p[4] == 0x65) {
 					fprintf(stderr, "fifo overflow ...\n");
@@ -677,19 +877,19 @@ void GrabThread::run()
 				if (p[4] == 0x65) {
 					fprintf(stderr, "patch pps/sps\n");
 					_cap->fifo_.push_back(slice_alloc(_cap->priv->data_, _cap->priv->len_,
-								data_info.pData0, data_info.uSize0, data_info.pts));
+								data_info.ptr0, data_info.size0, data_info.pts));
 				}
 				else {
-					_cap->fifo_.push_back(slice_alloc(data_info.pData0, data_info.uSize0, data_info.pts));
+					_cap->fifo_.push_back(slice_alloc(data_info.ptr0, data_info.size0, data_info.pts));
 				}
 
 				_cap->sem_fifo_.post();
 			}
 
-			if (data_info.uSize1 > 0) {
+			if (data_info.size1 > 0) {
 				ost::MutexLock al(_cap->cs_fifo_);
 
-				unsigned char *p = data_info.pData1;
+				unsigned char *p = data_info.ptr1;
 
 				if (_cap->fifo_.size() > 100 && p[4] == 0x65) {
 					fprintf(stderr, "fifo overflow ...\n");
@@ -706,28 +906,48 @@ void GrabThread::run()
 				if (p[4] == 0x65) {
 					fprintf(stderr, "patch pps/sps\n");
 					_cap->fifo_.push_back(slice_alloc(_cap->priv->data_, _cap->priv->len_,
-								data_info.pData1, data_info.uSize1, data_info.pts));
+								data_info.ptr1, data_info.size1, data_info.pts));
 				}
 				else {
-					_cap->fifo_.push_back(slice_alloc(data_info.pData1, data_info.uSize1, data_info.pts));
+					_cap->fifo_.push_back(slice_alloc(data_info.ptr1, data_info.size1, data_info.pts));
 				}
 
 				_cap->sem_fifo_.post();
 			}
 		}
+		
+		venc_device->ioctrl(venc_device, VENC_CMD_GET_MOTION_FLAG, &motion_flag);
+		if (motion_flag == 1)
+		{
+			/*检测到移动侦测*/
+			LOGD("motion_flag = %d", motion_flag);
+		}
 
-		g_pCedarV->ReleaseBitStreamInfo(g_pCedarV, data_info.idx);
+		//g_pCedarV->ReleaseBitStreamInfo(g_pCedarV, data_info.idx);
+		venc_device->ioctrl(venc_device, VENC_CMD_RETURN_BITSTREAM, &data_info);
 	}
 	
-	DeInitCapture(_cap);
-
+	//DeInitCapture(_cap);
+/*
 	if (g_pCedarV != NULL) {
 		g_pCedarV->close(g_pCedarV);
 		H264EncExit(g_pCedarV);
 		g_pCedarV = NULL;
 	}
+*/
+	/* stop camera */
+	g_venc_cam_cxt->CameraDevice->stopCamera(g_venc_cam_cxt->CameraDevice);
+	
+	DestroyCamera(g_venc_cam_cxt->CameraDevice);
+	g_venc_cam_cxt->CameraDevice = NULL;
+	
+	g_venc_cam_cxt->venc_device->ioctrl(g_venc_cam_cxt->venc_device, VENC_CMD_CLOSE, 0);
+	cedarvEncExit(g_venc_cam_cxt->venc_device);
+	g_venc_cam_cxt->venc_device = NULL;
 
-	cedarx_hardware_exit();
+	cedarx_hardware_exit(0);
+	
+	free(g_venc_cam_cxt);
 }
 
 
